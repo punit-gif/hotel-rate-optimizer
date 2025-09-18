@@ -1,0 +1,61 @@
+{
+  "services": [
+    {
+      "name": "api",
+      "envs": [
+        {
+          "key": "POSTGRES_URL",
+          "value": "${{ Postgres.DATABASE_URL }}"
+        },
+        {
+          "key": "OPENAI_API_KEY",
+          "value": ""
+        },
+        {
+          "key": "SENDGRID_API_KEY",
+          "value": ""
+        },
+        {
+          "key": "ADMIN_EMAIL",
+          "value": "admin@example.com"
+        },
+        {
+          "key": "ADMIN_PASSWORD",
+          "value": "ChangeMe123!"
+        },
+        {
+          "key": "JWT_SECRET",
+          "value": "please-change-me"
+        },
+        {
+          "key": "DASHBOARD_ORIGIN",
+          "value": "https://your-dashboard.onrailway.app"
+        },
+        {
+          "key": "SCHEDULE_TZ",
+          "value": "America/Chicago"
+        }
+      ],
+      "source": "."
+    },
+    {
+      "name": "dashboard",
+      "envs": [
+        {
+          "key": "POSTGRES_URL",
+          "value": "${{ Postgres.DATABASE_URL }}"
+        },
+        {
+          "key": "JWT_SECRET",
+          "value": "please-change-me"
+        }
+      ],
+      "source": "."
+    }
+  ],
+  "plugins": [
+    {
+      "name": "Postgres"
+    }
+  ]
+}
