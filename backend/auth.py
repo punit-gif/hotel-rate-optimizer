@@ -5,14 +5,14 @@ from typing import Optional, Dict, Any
 
 import bcrypt
 import jwt
-from fastapi import Request, HTTPException
+from fastapi import Request, HTTPException, Header, Query, Cookie
 
 from .db import get_conn
 
 # JWT settings
 JWT_SECRET = os.getenv("JWT_SECRET", "please-change-me")
 JWT_ALG = "HS256"
-JWT_EXP_SECONDS = 24 * 3600
+JWT_EXP_SECONDS = int(os.getenv("JWT_EXP_SECONDS", 24 * 3600))
 
 
 def create_token(user_id: int, email: str) -> str:
@@ -43,48 +43,56 @@ def verify_credentials(email: str, password: str) -> Optional[dict]:
     return None
 
 
-def _extract_bearer_token(request: Request) -> Optional[str]:
+def _from_auth_header(value: Optional[str]) -> Optional[str]:
     """
-    Try several places for the JWT:
-    1) Authorization: Bearer <token>
-    2) X-Forwarded-Authorization: Bearer <token>  (some proxies forward here)
-    3) token=<jwt> query param (fallback if proxies/shell drop headers)
+    Accept either 'Bearer <jwt>' or a raw JWT (some proxies strip the prefix).
     """
-    for name in (
-        "authorization",
-        "Authorization",
-        "x-forwarded-authorization",
-        "X-Forwarded-Authorization",
-    ):
-        val = request.headers.get(name)
-        if val:
-            parts = val.split(" ", 1)
-            if len(parts) == 2 and parts[0].lower() == "bearer":
-                return parts[1].strip()
-
-    qp = request.query_params.get("token")
-    if qp:
-        return qp.strip()
-
-    return None
+    if not value:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if value.lower().startswith("bearer "):
+        return value.split(" ", 1)[1].strip()
+    return value
 
 
-def get_current_user(request: Request) -> Dict[str, Any]:
-    token = _extract_bearer_token(request)
+def get_current_user(
+    request: Request,
+    # headers (FastAPI will inject these if present)
+    authorization: Optional[str] = Header(None, convert_underscores=False),
+    x_forwarded_authorization: Optional[str] = Header(
+        None, alias="X-Forwarded-Authorization", convert_underscores=False
+    ),
+    # query-string fallbacks
+    token_q: Optional[str] = Query(None, alias="token"),
+    access_token_q: Optional[str] = Query(None, alias="access_token"),
+    # cookie fallbacks (if you ever need them)
+    authorization_cookie: Optional[str] = Cookie(None, alias="Authorization"),
+    access_token_cookie: Optional[str] = Cookie(None, alias="access_token"),
+) -> Dict[str, Any]:
+    """
+    Extract JWT from multiple locations in a robust order of precedence.
+    """
+    candidates = [
+        _from_auth_header(authorization),
+        _from_auth_header(x_forwarded_authorization),
+        token_q,
+        access_token_q,
+        authorization_cookie,
+        access_token_cookie,
+    ]
+    token = next((t for t in candidates if t), None)
     if not token:
         raise HTTPException(status_code=401, detail="Missing token")
 
     try:
         data = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
-        user_id = data.get("sub")
+        uid = data.get("sub")
         email = data.get("email")
-
-        # basic sanity checks
-        if user_id is None or email is None:
+        if not uid or not email:
             raise HTTPException(status_code=401, detail="Invalid token")
-
-        return {"id": int(user_id), "email": email}
-
+        return {"id": int(uid), "email": email}
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
