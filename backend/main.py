@@ -3,19 +3,17 @@ import os
 import json
 import logging
 from datetime import date, timedelta
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 import pandas as pd
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import httpx  # kept in case you use it elsewhere
-import jwt
+import jwt  # PyJWT
 
 from .db import get_conn
-from .auth import create_token, verify_credentials, JWT_SECRET, get_current_user
+from .auth import create_token, verify_credentials, JWT_SECRET  # keep imports
 from .schemas import LoginRequest, ForecastItem, BriefRequest, ETLRunResponse
-from .pricing import choose_price  # if used elsewhere; safe to keep
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -30,23 +28,85 @@ logger = logging.getLogger("hotel-rate-api")
 # -------------------------------------------------------------------
 # Settings
 # -------------------------------------------------------------------
-DASHBOARD_ORIGIN = os.getenv("DASHBOARD_ORIGIN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# CORS origins (frontend on Railway + localhost). You can override with DASHBOARD_ORIGIN
+_default_origins = [
+    os.getenv("DASHBOARD_ORIGIN"),
+    "https://dashboard-frontend-production-3d65.up.railway.app",
+    "http://localhost:8501",  # Streamlit local
+    "http://localhost:5173",  # Vite
+    "http://localhost:3000",  # generic
+]
+origins = [o for o in _default_origins if o] or ["*"]
 
 app = FastAPI(title="Hotel Rate Optimizer API")
 
-# -------------------------------------------------------------------
-# CORS
-# -------------------------------------------------------------------
-origins = [DASHBOARD_ORIGIN] if DASHBOARD_ORIGIN else ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"],  # includes Authorization and Content-Type
+    expose_headers=["*"],
 )
 logger.info(f"CORS allow_origins={origins}")
+
+# -------------------------------------------------------------------
+# Auth helpers (header or ?token= fallback)
+# -------------------------------------------------------------------
+def _token_from_request(request: Request) -> Optional[str]:
+    # 1) Authorization: Bearer <JWT>
+    auth = request.headers.get("Authorization")
+    if auth and auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    # 2) Query param ?token=<JWT>
+    q = request.query_params.get("token")
+    if q:
+        return q.strip()
+    return None
+
+def _load_user_by_id(uid: int) -> Optional[Dict[str, Any]]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id, email, role FROM users WHERE id = %s",
+            (uid,),
+        ).fetchone()
+        return dict(row) if row else None
+
+def _decode_jwt(token: str) -> Dict[str, Any]:
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except Exception as e:
+        logger.warning(f"JWT decode failed: {e}")
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+async def current_user(request: Request) -> Dict[str, Any]:
+    """
+    Flexible auth: Authorization header OR ?token= query param.
+    Returns a dict with at least {id, email, role}.
+    """
+    token = _token_from_request(request)
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+
+    claims = _decode_jwt(token)
+    uid = claims.get("sub") or claims.get("user_id") or claims.get("id")
+    email = claims.get("email")
+
+    try:
+        uid_int = int(uid)
+    except Exception:
+        logger.warning(f"JWT missing/invalid user id: {uid}")
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    user = _load_user_by_id(uid_int)
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    # Prefer DB values; keep email from claims as fallback
+    user.setdefault("email", email)
+    return user
 
 # -------------------------------------------------------------------
 # Health
@@ -54,6 +114,14 @@ logger.info(f"CORS allow_origins={origins}")
 @app.get("/health")
 def health():
     return {"ok": True, "service": "hotel-rate-api"}
+
+# (Optional) quick DB sanity endpoint
+@app.get("/healthz/db")
+def healthz_db():
+    with get_conn() as conn:
+        fc = conn.execute("SELECT COUNT(*) AS c FROM forecasts").fetchone()["c"]
+        cr = conn.execute("SELECT COUNT(*) AS c FROM competitor_rates").fetchone()["c"]
+    return {"forecasts": fc, "competitor_rates": cr}
 
 # -------------------------------------------------------------------
 # Auth
@@ -68,22 +136,21 @@ def login(body: LoginRequest):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     token = create_token(user["id"], user["email"])
     logger.info(f"Login success for {masked}, uid={user['id']}")
-    return {"token": token}
+    return {"token": token, "user": {"id": user["id"], "email": user["email"], "role": user.get("role", "gm")}}
 
 # -------------------------------------------------------------------
 # Forecast
 # -------------------------------------------------------------------
 @app.get("/forecast", response_model=List[ForecastItem])
 def get_forecast(
-    start: str = Query(...),
-    end: str = Query(...),
-    current_user: dict = Depends(get_current_user),
+    start: str = Query(..., description="YYYY-MM-DD"),
+    end: str = Query(..., description="YYYY-MM-DD"),
+    user: dict = Depends(current_user),
 ):
-    logger.info(f"/forecast requested by uid={current_user['id']} range {start}..{end}")
+    logger.info(f"/forecast by uid={user['id']} range {start}..{end}")
     start_d, end_d = date.fromisoformat(start), date.fromisoformat(end)
 
     with get_conn() as conn:
-        # pull forecasts
         rows = conn.execute(
             """
             SELECT stay_date, room_type, demand_forecast, rec_adr
@@ -100,7 +167,6 @@ def get_forecast(
 
         df = pd.DataFrame(rows)
 
-        # competitor median by date+room
         comp = conn.execute(
             """
             SELECT stay_date, room_type,
@@ -114,7 +180,7 @@ def get_forecast(
 
         comp_df = pd.DataFrame(comp) if comp else pd.DataFrame(columns=["stay_date", "room_type", "comp_median"])
 
-    out = []
+    out: List[ForecastItem] = []
     for _, r in df.iterrows():
         cm = None
         if not comp_df.empty:
@@ -137,13 +203,14 @@ def get_forecast(
 # -------------------------------------------------------------------
 # Brief
 # -------------------------------------------------------------------
-def _openai_brief(forecast_rows: list[dict]) -> str:
+def _openai_brief(forecast_rows: List[Dict[str, Any]]) -> str:
     if not OPENAI_API_KEY:
         logger.info("OPENAI_API_KEY not set; returning fallback brief")
         lines = ["Daily Rate Brief (fallback):"]
         for r in forecast_rows:
+            rec = r.get("rec_adr") or r.get("recommended_adr") or r.get("rec_adr".upper(), None)
             lines.append(
-                f"{r['stay_date']} {r['room_type']}: demand {r['demand_forecast']:.0f}, rec ADR ${r['rec_adr']:.2f}"
+                f"{r['stay_date']} {r['room_type']}: demand {float(r['demand_forecast']):.0f}, rec ADR ${float(rec):.2f}"
             )
         return "\n".join(lines)
 
@@ -166,16 +233,16 @@ def _openai_brief(forecast_rows: list[dict]) -> str:
             {"role": "user", "content": prompt},
         ],
         temperature=0.3,
-        timeout=20,  # seconds
+        timeout=20,
     )
     return resp.choices[0].message.content
 
 @app.post("/brief")
 def brief(
     req: BriefRequest,
-    current_user: dict = Depends(get_current_user),
+    user: dict = Depends(current_user),
 ):
-    logger.info(f"/brief requested by uid={current_user['id']} (send={req.send})")
+    logger.info(f"/brief by uid={user['id']} (send={req.send})")
     today = date.today()
     until = today + timedelta(days=6)
 
@@ -209,7 +276,8 @@ def brief(
             from notifier.emailer import send_rate_brief  # type: ignore
         except Exception:
             logger.warning("notifier.emailer not available; skipping email send")
-            send_rate_brief = lambda to_email, subject, html_body: None
+            def send_rate_brief(*args, **kwargs):  # no-op
+                return None
         send_rate_brief(to, "Daily Rate Brief", f"<pre>{text}</pre>")
 
     logger.info("Brief generated")
@@ -219,17 +287,17 @@ def brief(
 # ETL + ML
 # -------------------------------------------------------------------
 @app.post("/etl/run", response_model=ETLRunResponse)
-def etl_run(current_user: dict = Depends(get_current_user)):
-    logger.info(f"/etl/run triggered by uid={current_user['id']}")
-    import subprocess, sys
+def etl_run(user: dict = Depends(current_user)):
+    logger.info(f"/etl/run triggered by uid={user['id']}")
+    import subprocess, sys, pathlib
 
     env = os.environ.copy()
+    root = pathlib.Path(__file__).resolve().parents[1]  # project root
 
     def run_py(path: str) -> str:
-        root = os.path.dirname(os.path.dirname(__file__))  # project root
         cp = subprocess.run(
             [sys.executable, path],
-            cwd=root,
+            cwd=str(root),
             env=env,
             capture_output=True,
             text=True,
@@ -240,7 +308,8 @@ def etl_run(current_user: dict = Depends(get_current_user)):
         logger.info(f"Script {path} OK ({len(cp.stdout)} bytes stdout)")
         return cp.stdout
 
-    etl_out = run_py("etl/etl.py")
-    ml_out = run_py("ml/model.py")
+    # Run ETL then ML
+    run_py("etl/etl.py")
+    run_py("ml/model.py")
     logger.info("/etl/run finished")
     return ETLRunResponse(message="ETL+ML completed")
