@@ -8,11 +8,10 @@ from typing import List, Optional, Dict, Any
 import pandas as pd
 from fastapi import FastAPI, Depends, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 import jwt  # PyJWT
 
 from .db import get_conn
-from .auth import create_token, verify_credentials, JWT_SECRET  # keep imports
+from .auth import create_token, verify_credentials, JWT_SECRET
 from .schemas import LoginRequest, ForecastItem, BriefRequest, ETLRunResponse
 
 from dotenv import load_dotenv
@@ -30,13 +29,13 @@ logger = logging.getLogger("hotel-rate-api")
 # -------------------------------------------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# CORS origins (frontend on Railway + localhost). You can override with DASHBOARD_ORIGIN
+# CORS origins
 _default_origins = [
     os.getenv("DASHBOARD_ORIGIN"),
     "https://dashboard-frontend-production-3d65.up.railway.app",
-    "http://localhost:8501",  # Streamlit local
-    "http://localhost:5173",  # Vite
-    "http://localhost:3000",  # generic
+    "http://localhost:8501",
+    "http://localhost:5173",
+    "http://localhost:3000",
 ]
 origins = [o for o in _default_origins if o] or ["*"]
 
@@ -47,20 +46,18 @@ app.add_middleware(
     allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],  # includes Authorization and Content-Type
+    allow_headers=["*"],
     expose_headers=["*"],
 )
 logger.info(f"CORS allow_origins={origins}")
 
 # -------------------------------------------------------------------
-# Auth helpers (header or ?token= fallback)
+# Auth helpers (header or ?token=)
 # -------------------------------------------------------------------
 def _token_from_request(request: Request) -> Optional[str]:
-    # 1) Authorization: Bearer <JWT>
     auth = request.headers.get("Authorization")
     if auth and auth.lower().startswith("bearer "):
         return auth.split(" ", 1)[1].strip()
-    # 2) Query param ?token=<JWT>
     q = request.query_params.get("token")
     if q:
         return q.strip()
@@ -82,29 +79,20 @@ def _decode_jwt(token: str) -> Dict[str, Any]:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 async def current_user(request: Request) -> Dict[str, Any]:
-    """
-    Flexible auth: Authorization header OR ?token= query param.
-    Returns a dict with at least {id, email, role}.
-    """
     token = _token_from_request(request)
     if not token:
         raise HTTPException(status_code=401, detail="Missing token")
-
     claims = _decode_jwt(token)
     uid = claims.get("sub") or claims.get("user_id") or claims.get("id")
     email = claims.get("email")
-
     try:
         uid_int = int(uid)
     except Exception:
         logger.warning(f"JWT missing/invalid user id: {uid}")
         raise HTTPException(status_code=401, detail="Invalid token payload")
-
     user = _load_user_by_id(uid_int)
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
-
-    # Prefer DB values; keep email from claims as fallback
     user.setdefault("email", email)
     return user
 
@@ -115,7 +103,6 @@ async def current_user(request: Request) -> Dict[str, Any]:
 def health():
     return {"ok": True, "service": "hotel-rate-api"}
 
-# (Optional) quick DB sanity endpoint
 @app.get("/healthz/db")
 def healthz_db():
     with get_conn() as conn:
@@ -208,7 +195,7 @@ def _openai_brief(forecast_rows: List[Dict[str, Any]]) -> str:
         logger.info("OPENAI_API_KEY not set; returning fallback brief")
         lines = ["Daily Rate Brief (fallback):"]
         for r in forecast_rows:
-            rec = r.get("rec_adr") or r.get("recommended_adr") or r.get("rec_adr".upper(), None)
+            rec = r.get("rec_adr") or r.get("recommended_adr")
             lines.append(
                 f"{r['stay_date']} {r['room_type']}: demand {float(r['demand_forecast']):.0f}, rec ADR ${float(rec):.2f}"
             )
@@ -269,19 +256,24 @@ def brief(
     data = [dict(r) for r in rows]
     text = _openai_brief(data)
 
-    if req.send:
-        to = req.to_email or os.getenv("ADMIN_EMAIL", "admin@example.com")
-        logger.info(f"Sending brief email to {to}")
-        try:
-            from notifier.emailer import send_rate_brief  # type: ignore
-        except Exception:
-            logger.warning("notifier.emailer not available; skipping email send")
-            def send_rate_brief(*args, **kwargs):  # no-op
-                return None
-        send_rate_brief(to, "Daily Rate Brief", f"<pre>{text}</pre>")
+    email_status = "skipped"
+    email_error: Optional[str] = None
 
-    logger.info("Brief generated")
-    return {"brief": text}
+    if req.send:
+        to = (req.to_email or os.getenv("ADMIN_EMAIL", "admin@example.com")).strip()
+        logger.info(f"Attempting to email brief to {to}")
+        try:
+            from notifier.emailer import send_rate_brief  # uses SMTP; see notifier/emailer.py
+            send_rate_brief(to, "Daily Rate Brief", f"<pre>{text}</pre>")
+            email_status = "sent"
+            logger.info("Email sent.")
+        except Exception as e:
+            # NEVER fail the endpoint due to email issues
+            email_status = "error"
+            email_error = str(e)
+            logger.exception("Email send failed")
+
+    return {"brief": text, "email_status": email_status, "email_error": email_error}
 
 # -------------------------------------------------------------------
 # ETL + ML
@@ -292,7 +284,7 @@ def etl_run(user: dict = Depends(current_user)):
     import subprocess, sys, pathlib
 
     env = os.environ.copy()
-    root = pathlib.Path(__file__).resolve().parents[1]  # project root
+    root = pathlib.Path(__file__).resolve().parents[1]
 
     def run_py(path: str) -> str:
         cp = subprocess.run(
@@ -308,7 +300,6 @@ def etl_run(user: dict = Depends(current_user)):
         logger.info(f"Script {path} OK ({len(cp.stdout)} bytes stdout)")
         return cp.stdout
 
-    # Run ETL then ML
     run_py("etl/etl.py")
     run_py("ml/model.py")
     logger.info("/etl/run finished")
