@@ -1,12 +1,18 @@
 # etl/etl.py
 import os
+import sys
 import csv
 from pathlib import Path
 from sqlalchemy import text
-from backend.db import engine  # <- shared, normalized engine (psycopg v3)
-from typing import Tuple
 
-BASE = Path(__file__).resolve().parents[1]
+# --- Make project root importable (Railway subprocess safe) ---
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from backend.db import engine  # <- shared, normalized engine (psycopg v3)
+
+BASE = ROOT
 RES_PATH = BASE / "sample_data" / "reservations_30d.csv"
 COMP_PATH = BASE / "sample_data" / "competitors_30d.csv"
 INBOX_PATH = BASE / "inbox" / "nightly.csv"  # header-only placeholder in Sprint 0
@@ -26,7 +32,6 @@ def upsert_reservations(conn) -> int:
     with RES_PATH.open(newline="", encoding="utf-8") as f:
         rd = csv.DictReader(f)
         for row in rd:
-            # Defensive casting
             sql = text("""
                 INSERT INTO reservations (date, room_type, rooms_sold, rooms_available, adr, revenue)
                 VALUES (:date, :room_type, :rooms_sold, :rooms_available, :adr, :revenue)
