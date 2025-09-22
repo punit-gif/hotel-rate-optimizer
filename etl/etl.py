@@ -10,7 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from backend.db import engine  # <- shared, normalized engine (psycopg v3)
+# Use LAZY engine factory (prevents import-time failures)
+from backend.db import get_engine  # <- lazy, normalized to postgresql+psycopg
 
 BASE = ROOT
 RES_PATH = BASE / "sample_data" / "reservations_30d.csv"
@@ -105,8 +106,8 @@ def maybe_ingest_nightly(conn) -> int:
 
 
 def main():
-    # Engine is imported from backend.db (already normalized to psycopg v3)
-    with engine.begin() as conn:
+    eng = get_engine()  # <- create engine only when running
+    with eng.begin() as conn:
         print("[etl] Connected.")
         r = upsert_reservations(conn)
         c = upsert_competitors(conn)
