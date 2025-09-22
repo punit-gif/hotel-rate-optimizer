@@ -1,56 +1,113 @@
-import os, sys
-import pandas as pd
-from sqlalchemy import create_engine, text
-from dotenv import load_dotenv
+# etl/etl.py
+import os
+import csv
 from pathlib import Path
-from datetime import datetime
+from sqlalchemy import text
+from backend.db import engine  # <- shared, normalized engine (psycopg v3)
+from typing import Tuple
 
-load_dotenv()
-POSTGRES_URL = os.getenv("POSTGRES_URL")
 BASE = Path(__file__).resolve().parents[1]
+RES_PATH = BASE / "sample_data" / "reservations_30d.csv"
+COMP_PATH = BASE / "sample_data" / "competitors_30d.csv"
+INBOX_PATH = BASE / "inbox" / "nightly.csv"  # header-only placeholder in Sprint 0
 
-def upsert_reservations(engine, df):
-    with engine.begin() as conn:
-        for _, r in df.iterrows():
-            conn.execute(text("""
-                DELETE FROM reservations WHERE stay_date=:d AND room_type=:rt;
-                INSERT INTO reservations(stay_date, room_type, occupancy, adr)
-                VALUES(:d,:rt,:occ,:adr);
-            """), {"d": r['stay_date'], "rt": r['room_type'], "occ": int(r['occupancy']), "adr": float(r['adr'])})
 
-def upsert_competitors(engine, df):
-    with engine.begin() as conn:
-        for _, r in df.iterrows():
-            conn.execute(text("""
-                DELETE FROM competitor_rates WHERE stay_date=:d AND room_type=:rt AND competitor=:c;
-                INSERT INTO competitor_rates(stay_date, competitor, room_type, rate)
-                VALUES(:d,:c,:rt,:rate);
-            """), {"d": r['stay_date'], "rt": r['room_type'], "c": r['competitor'], "rate": float(r['rate'])})
+def upsert_reservations(conn) -> int:
+    """
+    Upsert reservations from sample_data/reservations_30d.csv
+    Expected columns:
+      date,room_type,rooms_sold,rooms_available,adr,revenue
+    """
+    inserted = 0
+    if not RES_PATH.exists():
+        print(f"[etl] WARN: {RES_PATH} not found; skipping reservations.")
+        return 0
 
-def load_csvs():
-    res_path = BASE / "sample_data" / "reservations_30d.csv"
-    comp_path = BASE / "sample_data" / "competitors_30d.csv"
-    inbox_path = BASE / "inbox" / "nightly.csv"
-    res = pd.read_csv(res_path, parse_dates=['date'])
-    res = res.rename(columns={'date':'stay_date'})
-    res['stay_date'] = res['stay_date'].dt.date
-    # optional nightly
-    if inbox_path.exists():
-        n = pd.read_csv(inbox_path, parse_dates=['date']).rename(columns={'date':'stay_date'})
-        n['stay_date'] = n['stay_date'].dt.date
-        res = pd.concat([res, n], ignore_index=True).drop_duplicates(['stay_date','room_type'], keep='last')
-    comp = pd.read_csv(comp_path, parse_dates=['date']).rename(columns={'date':'stay_date'})
-    comp['stay_date'] = comp['stay_date'].dt.date
-    return res, comp
+    with RES_PATH.open(newline="", encoding="utf-8") as f:
+        rd = csv.DictReader(f)
+        for row in rd:
+            # Defensive casting
+            sql = text("""
+                INSERT INTO reservations (date, room_type, rooms_sold, rooms_available, adr, revenue)
+                VALUES (:date, :room_type, :rooms_sold, :rooms_available, :adr, :revenue)
+                ON CONFLICT (date, room_type) DO UPDATE
+                SET rooms_sold     = EXCLUDED.rooms_sold,
+                    rooms_available = EXCLUDED.rooms_available,
+                    adr             = EXCLUDED.adr,
+                    revenue         = EXCLUDED.revenue
+            """)
+            conn.execute(sql, {
+                "date": row["date"],
+                "room_type": row["room_type"],
+                "rooms_sold": int(row["rooms_sold"]),
+                "rooms_available": int(row["rooms_available"]),
+                "adr": float(row["adr"]),
+                "revenue": float(row["revenue"]),
+            })
+            inserted += 1
+    return inserted
+
+
+def upsert_competitors(conn) -> int:
+    """
+    Upsert competitor rates from sample_data/competitors_30d.csv
+    Expected columns:
+      date,competitor,room_type,rate
+    """
+    inserted = 0
+    if not COMP_PATH.exists():
+        print(f"[etl] WARN: {COMP_PATH} not found; skipping competitor rates.")
+        return 0
+
+    with COMP_PATH.open(newline="", encoding="utf-8") as f:
+        rd = csv.DictReader(f)
+        for row in rd:
+            sql = text("""
+                INSERT INTO competitor_rates (date, competitor, room_type, rate)
+                VALUES (:date, :competitor, :room_type, :rate)
+                ON CONFLICT (date, competitor, room_type) DO UPDATE
+                SET rate = EXCLUDED.rate
+            """)
+            conn.execute(sql, {
+                "date": row["date"],
+                "competitor": row["competitor"],
+                "room_type": row["room_type"],
+                "rate": float(row["rate"]),
+            })
+            inserted += 1
+    return inserted
+
+
+def maybe_ingest_nightly(conn) -> int:
+    """
+    Optional: tolerate header-only nightly.csv without error.
+    Format (placeholder): date,room_type,occupancy,adr
+    We **skip** ingest in Sprint 0 because it doesn’t match the baseline schema
+    (rooms_sold/rooms_available). Returning 0 keeps logs clean.
+    """
+    if not INBOX_PATH.exists():
+        return 0
+    # If the file only has headers or is empty, do nothing.
+    try:
+        with INBOX_PATH.open("r", encoding="utf-8") as f:
+            lines = [ln for ln in f.readlines() if ln.strip()]
+        if len(lines) <= 1:
+            return 0
+    except Exception:
+        return 0
+    # If you later want to map occupancy → rooms_sold, add logic here.
+    return 0
+
 
 def main():
-    if not POSTGRES_URL:
-        raise RuntimeError("POSTGRES_URL not set")
-    engine = create_engine(POSTGRES_URL)
-    res, comp = load_csvs()
-    upsert_reservations(engine, res)
-    upsert_competitors(engine, comp)
-    print(f"Upserted {len(res)} reservations and {len(comp)} comp rates")
+    # Engine is imported from backend.db (already normalized to psycopg v3)
+    with engine.begin() as conn:
+        print("[etl] Connected.")
+        r = upsert_reservations(conn)
+        c = upsert_competitors(conn)
+        n = maybe_ingest_nightly(conn)
+        print(f"[etl] Upserted {r} reservations and {c} competitor rates. (nightly added {n})")
+
 
 if __name__ == "__main__":
     main()
