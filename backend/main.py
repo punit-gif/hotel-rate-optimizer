@@ -154,13 +154,16 @@ def get_forecast(
 
         df = pd.DataFrame(rows)
 
+        # NOTE: competitor_rates uses column "date" (not "stay_date")
         comp = conn.execute(
             """
-            SELECT stay_date, room_type,
-                   PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY rate) AS comp_median
+            SELECT
+                date AS stay_date,
+                room_type,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY rate) AS comp_median
             FROM competitor_rates
-            WHERE stay_date BETWEEN %s AND %s
-            GROUP BY stay_date, room_type
+            WHERE date BETWEEN %s AND %s
+            GROUP BY date, room_type
             """,
             (start_d, end_d),
         ).fetchall()
@@ -240,7 +243,7 @@ def brief(
                    (
                      SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY rate)
                      FROM competitor_rates c
-                     WHERE c.stay_date=f.stay_date AND c.room_type=f.room_type
+                     WHERE c.date = f.stay_date AND c.room_type = f.room_type
                    ) AS comp_median
             FROM forecasts f
             WHERE f.stay_date BETWEEN %s AND %s
